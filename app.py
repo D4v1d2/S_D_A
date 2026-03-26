@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 
 def configure_logging():
-    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = os.getenv("LOG_LEVEL", "DEBUG").upper()
     # Permite cambiar la ruta del archivo de log por variable de entorno.
     log_file = os.getenv("LOG_FILE", os.path.join("logs", "api_registro.log"))
     log_directory = os.path.dirname(log_file)
@@ -27,7 +27,7 @@ def configure_logging():
             "disable_existing_loggers": False,
             "formatters": {
                 "standard": {
-                    "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+                    "format": "%(asctime)s | %(levelname)s | %(message)s"
                 }
             },
             "handlers": {
@@ -65,6 +65,15 @@ db_logger = logging.getLogger("api_registro.db")
 routes_logger = logging.getLogger("api_registro.routes")
 
 
+def mask_email(email):
+    if not email or "@" not in email:
+        return "correo_no_disponible"
+
+    local_part, domain = email.split("@", 1)
+    visible_prefix = local_part[:2]
+    return f"{visible_prefix}***@{domain}"
+
+
 def get_db_connection():
     db_logger.debug("Abriendo conexión a SQLite")
     conn = sqlite3.connect("usuarios.db")
@@ -85,16 +94,17 @@ def token_required(f):
                 token = parts[1]
 
         if not token:
+            auth_logger.warning("Acceso denegado: token no proporcionado")
             return jsonify({"error": "Token requerido"}), 401
 
         try:
             data = jwt.decode(token, Config.SECRET_KEY, algorithms=[Config.JWT_ALGORITHM])
             g.user = data
         except jwt.ExpiredSignatureError:
-            auth_logger.warning("Token expirado")
+            auth_logger.warning("Acceso denegado: token expirado")
             return jsonify({"error": "Token expirado"}), 401
         except jwt.InvalidTokenError as e:
-            auth_logger.warning("Token inválido: %s", e)
+            auth_logger.warning("Acceso denegado: token inválido (%s)", e)
             return jsonify({"error": "Token inválido"}), 401
 
         return f(*args, **kwargs)
@@ -108,11 +118,16 @@ def registro():
 
     email = data.get("email")
     password = data.get("password")
+    masked_email = mask_email(email)
+
+    routes_logger.debug("Procesando solicitud de registro para %s", masked_email)
 
     if not email or not password:
+        routes_logger.warning("Registro rechazado: faltan credenciales")
         return jsonify({"error": "Credenciales Invalidas"}), 400
 
     if len(password) < 8:
+        routes_logger.warning("Registro rechazado para %s: password demasiado corta", masked_email)
         return jsonify({"error": "Password debe tener mínimo 8 caracteres"}), 400
 
     conn = get_db_connection()
@@ -123,20 +138,26 @@ def registro():
 
     if usuario_existente:
         conn.close()
-        routes_logger.info("Intento de registro con email existente: %s", email)
+        routes_logger.warning("Registro rechazado: el usuario %s ya existe", masked_email)
         return jsonify({"error": "El usuario ya existe"}), 409
 
-    password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+    try:
+        password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
-    cursor.execute(
-        "INSERT INTO usuarios (email, password, role) VALUES (?, ?, ?)",
-        (email, password_hash, "user")
-    )
+        cursor.execute(
+            "INSERT INTO usuarios (email, password, role) VALUES (?, ?, ?)",
+            (email, password_hash, "user")
+        )
 
-    conn.commit()
-    conn.close()
-
-    return jsonify({"mensaje": "Usuario Registrado"}), 201
+        conn.commit()
+        routes_logger.info("Registro exitoso para %s", masked_email)
+        return jsonify({"mensaje": "Usuario Registrado"}), 201
+    except sqlite3.Error:
+        conn.rollback()
+        db_logger.error("Fallo del sistema al registrar usuario %s", masked_email, exc_info=True)
+        return jsonify({"error": "Error del servidor"}), 500
+    finally:
+        conn.close()
 
 
 @app.route("/recuperacion", methods=["POST"])
@@ -145,11 +166,16 @@ def recuperacion():
 
     email = data.get("email")
     new_password = data.get("password")
+    masked_email = mask_email(email)
+
+    routes_logger.debug("Procesando recuperación de contraseña para %s", masked_email)
 
     if not email or not new_password:
+        routes_logger.warning("Recuperación rechazada: faltan datos obligatorios")
         return jsonify({"error": "Email y password son obligatorios"}), 400
 
     if len(new_password) < 8:
+        routes_logger.warning("Recuperación rechazada para %s: password inválida", masked_email)
         return jsonify({"error": "Password invalido"}), 400
 
     conn = get_db_connection()
@@ -160,6 +186,7 @@ def recuperacion():
         usuario = cursor.fetchone()
 
         if not usuario:
+            routes_logger.warning("Recuperación rechazada: usuario no encontrado para %s", masked_email)
             return jsonify({"error": "Usuario no encontrado"}), 404
 
         hashed = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt())
@@ -170,11 +197,12 @@ def recuperacion():
         )
 
         conn.commit()
+        auth_logger.info("Contraseña actualizada correctamente para %s", masked_email)
         return jsonify({"message": "Contraseña actualizada correctamente"}), 200
 
     except sqlite3.Error:
         conn.rollback()
-        db_logger.exception("Error SQLite durante recuperación de contraseña")
+        db_logger.error("Fallo del sistema durante recuperación de contraseña para %s", masked_email, exc_info=True)
         return jsonify({"error": "Error del servidor"}), 500
     finally:
         conn.close()
@@ -186,44 +214,55 @@ def login():
 
     email = data.get("email")
     password = data.get("password")
+    masked_email = mask_email(email)
+
+    auth_logger.debug("Procesando intento de login para %s", masked_email)
 
     if not email or not password:
+        auth_logger.warning("Login rechazado: faltan credenciales")
         return jsonify({"error": "Email y password son obligatorios"}), 400
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM usuarios WHERE email = ?", (email,))
-    usuario = cursor.fetchone()
-    conn.close()
+    try:
+        cursor.execute("SELECT * FROM usuarios WHERE email = ?", (email,))
+        usuario = cursor.fetchone()
 
-    if not usuario:
+        if not usuario:
+            auth_logger.warning("Login fallido: usuario no encontrado para %s", masked_email)
+            return jsonify({"error": "Credenciales Invalidas"}), 401
+
+        stored_password = usuario["password"]
+
+        if isinstance(stored_password, str):
+            stored_password = stored_password.encode("utf-8")
+
+        if bcrypt.checkpw(password.encode("utf-8"), stored_password):
+
+            payload = {
+                "sub": str(usuario["id"]),
+                "email": usuario["email"],
+                "role": usuario["role"],
+                "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1),
+                "iat": datetime.datetime.now(datetime.timezone.utc),
+            }
+
+            encoded_jwt = jwt.encode(payload, Config.SECRET_KEY, algorithm=Config.JWT_ALGORITHM)
+            auth_logger.info("Login exitoso para %s", masked_email)
+
+            return jsonify({
+                "message": "Login exitoso",
+                "role": usuario["role"],
+                "token": encoded_jwt
+            }), 200
+
+        auth_logger.warning("Login fallido: password incorrecta para %s", masked_email)
         return jsonify({"error": "Credenciales Invalidas"}), 401
-
-    stored_password = usuario["password"]
-
-    if isinstance(stored_password, str):
-        stored_password = stored_password.encode("utf-8")
-
-    if bcrypt.checkpw(password.encode("utf-8"), stored_password):
-
-        payload = {
-            "sub": str(usuario["id"]),
-            "email": usuario["email"],
-            "role": usuario["role"],
-            "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1),
-            "iat": datetime.datetime.now(datetime.timezone.utc),
-        }
-
-        encoded_jwt = jwt.encode(payload, Config.SECRET_KEY, algorithm=Config.JWT_ALGORITHM)
-        auth_logger.info("Login exitoso para usuario: %s", email)
-
-        return jsonify({
-            "message": "Login exitoso",
-            "role": usuario["role"],
-            "token": encoded_jwt
-        }), 200
-
-    return jsonify({"error": "Credenciales Invalidas"}), 401
+    except sqlite3.Error:
+        db_logger.error("Fallo del sistema durante login para %s", masked_email, exc_info=True)
+        return jsonify({"error": "Error del servidor"}), 500
+    finally:
+        conn.close()
 
 
 # =========================
@@ -236,8 +275,11 @@ def crear_reserva():
     
     fecha = data.get("fecha")
     detalle = data.get("detalle")
+
+    routes_logger.debug("Procesando creación de reserva para usuario_id=%s", g.user["sub"])
     
     if not fecha or not detalle:
+        routes_logger.warning("Reserva rechazada: faltan fecha o detalle para usuario_id=%s", g.user["sub"])
         return jsonify({"error": "Fecha y detalle son obligatorios"}), 400
     
     conn = get_db_connection()
@@ -250,10 +292,11 @@ def crear_reserva():
             (g.user["sub"], fecha, detalle)
         )
         conn.commit()
+        routes_logger.info("Reserva creada para usuario_id=%s con id=%s", g.user["sub"], cursor.lastrowid)
         return jsonify({"message": "Reserva creada", "id": cursor.lastrowid}), 201
-    except sqlite3.Error as e:
+    except sqlite3.Error:
         conn.rollback()
-        db_logger.exception("Error SQLite al crear reserva: %s", e)
+        db_logger.error("Fallo del sistema al crear reserva para usuario_id=%s", g.user["sub"], exc_info=True)
         return jsonify({"error": "Error interno en la base de datos"}), 500
     finally:
         conn.close()
@@ -268,8 +311,11 @@ def publicar_articulo():
     
     titulo = data.get("titulo", "").strip()
     contenido = data.get("contenido", "").strip() # Cambiado de 'descripcion' a 'contenido'
+
+    routes_logger.debug("Procesando publicación de artículo para usuario_id=%s", g.user["sub"])
     
     if not titulo or not contenido:
+        routes_logger.warning("Publicación rechazada: faltan título o contenido para usuario_id=%s", g.user["sub"])
         return jsonify({"error": "Título y contenido son obligatorios"}), 400
     
     conn = get_db_connection()
@@ -281,10 +327,11 @@ def publicar_articulo():
             (g.user["sub"], titulo, contenido)
         )
         conn.commit()
+        routes_logger.info("Artículo publicado para usuario_id=%s con id=%s", g.user["sub"], cursor.lastrowid)
         return jsonify({"message": "Artículo publicado", "id": cursor.lastrowid}), 201
-    except sqlite3.Error as e:
+    except sqlite3.Error:
         conn.rollback()
-        db_logger.exception("Error SQLite al publicar artículo: %s", e)
+        db_logger.error("Fallo del sistema al publicar artículo para usuario_id=%s", g.user["sub"], exc_info=True)
         return jsonify({"error": "Error al publicar artículo"}), 500
     finally:
         conn.close()
@@ -297,9 +344,16 @@ def comprar():
     
     articulo_id = data.get("articulo_id")
     cantidad = data.get("cantidad")
+
+    routes_logger.debug(
+        "Procesando compra para usuario_id=%s, articulo_id=%s",
+        g.user["sub"],
+        articulo_id,
+    )
     
     # Validación de datos
     if not articulo_id or not cantidad:
+        routes_logger.warning("Compra rechazada: faltan datos para usuario_id=%s", g.user["sub"])
         return jsonify({"error": "ID de artículo y cantidad son obligatorios"}), 400
     
     # Asegurarnos de que la cantidad sea un número
@@ -308,6 +362,7 @@ def comprar():
         if cantidad <= 0:
             raise ValueError
     except (ValueError, TypeError):
+        routes_logger.warning("Compra rechazada: cantidad inválida para usuario_id=%s", g.user["sub"])
         return jsonify({"error": "La cantidad debe ser un número positivo"}), 400
     
     conn = get_db_connection()
@@ -320,13 +375,19 @@ def comprar():
             (g.user["sub"], articulo_id, cantidad)
         )
         conn.commit()
+        routes_logger.info(
+            "Compra registrada para usuario_id=%s, articulo_id=%s, id=%s",
+            g.user["sub"],
+            articulo_id,
+            cursor.lastrowid,
+        )
         return jsonify({
             "message": "Compra realizada con éxito", 
             "id": cursor.lastrowid
         }), 201
-    except sqlite3.Error as e:
+    except sqlite3.Error:
         conn.rollback()
-        db_logger.exception("Error SQLite en compra: %s", e)
+        db_logger.error("Fallo del sistema en compra para usuario_id=%s", g.user["sub"], exc_info=True)
         return jsonify({"error": "No se pudo procesar la compra en la base de datos"}), 500
     finally:
         conn.close()

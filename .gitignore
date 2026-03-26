@@ -3,3 +3,6 @@ __pycache__/
 .pycache/
 *.db
 .env
+logs/
+.DS_Store
+.vscode/

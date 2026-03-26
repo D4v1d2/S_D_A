@@ -3,12 +3,68 @@ import sqlite3
 import bcrypt
 import jwt
 import datetime
+import logging
+import logging.config
+import os
 from functools import wraps
 from config import config as Config
 
 app = Flask(__name__)
 
+
+def configure_logging():
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_file = os.getenv("LOG_FILE", os.path.join("logs", "api_registro.log"))
+    log_directory = os.path.dirname(log_file)
+
+    if log_directory:
+        os.makedirs(log_directory, exist_ok=True)
+
+    logging.config.dictConfig(
+        {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "formatters": {
+                "standard": {
+                    "format": "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+                }
+            },
+            "handlers": {
+                "console": {
+                    "class": "logging.StreamHandler",
+                    "formatter": "standard",
+                    "level": level,
+                },
+                "file": {
+                    "class": "logging.FileHandler",
+                    "formatter": "standard",
+                    "level": level,
+                    "filename": log_file,
+                    "encoding": "utf-8",
+                }
+            },
+            "loggers": {
+                "api_registro": {
+                    "handlers": ["console", "file"],
+                    "level": level,
+                    "propagate": False,
+                },
+                "api_registro.auth": {"level": level, "propagate": True},
+                "api_registro.db": {"level": level, "propagate": True},
+                "api_registro.routes": {"level": level, "propagate": True},
+            },
+        }
+    )
+
+
+configure_logging()
+logger = logging.getLogger("api_registro")
+auth_logger = logging.getLogger("api_registro.auth")
+db_logger = logging.getLogger("api_registro.db")
+routes_logger = logging.getLogger("api_registro.routes")
+
 def get_db_connection():
+    db_logger.debug("Abriendo conexión a SQLite")
     conn = sqlite3.connect("usuarios.db")
     conn.row_factory = sqlite3.Row
     return conn
@@ -33,9 +89,10 @@ def token_required(f):
             data = jwt.decode(token, Config.SECRET_KEY, algorithms=[Config.JWT_ALGORITHM])
             g.user = data
         except jwt.ExpiredSignatureError:
+            auth_logger.warning("Token expirado")
             return jsonify({"error": "Token expirado"}), 401
         except jwt.InvalidTokenError as e:
-            print(f"\n🔴 ERROR INTERNO DE JWT: {e}\n")
+            auth_logger.warning("Token inválido: %s", e)
             return jsonify({"error": "Token inválido"}), 401
 
         return f(*args, **kwargs)
@@ -64,6 +121,7 @@ def registro():
 
     if usuario_existente:
         conn.close()
+        routes_logger.info("Intento de registro con email existente: %s", email)
         return jsonify({"error": "El usuario ya existe"}), 409
 
     password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
@@ -114,6 +172,7 @@ def recuperacion():
 
     except sqlite3.Error:
         conn.rollback()
+        db_logger.exception("Error SQLite durante recuperación de contraseña")
         return jsonify({"error": "Error del servidor"}), 500
     finally:
         conn.close()
@@ -154,6 +213,7 @@ def login():
         }
 
         encoded_jwt = jwt.encode(payload, Config.SECRET_KEY, algorithm=Config.JWT_ALGORITHM)
+        auth_logger.info("Login exitoso para usuario: %s", email)
 
         return jsonify({
             "message": "Login exitoso",
@@ -191,8 +251,7 @@ def crear_reserva():
         return jsonify({"message": "Reserva creada", "id": cursor.lastrowid}), 201
     except sqlite3.Error as e:
         conn.rollback()
-        # Esto te dirá exactamente qué falló en la terminal
-        print(f"Error SQLite: {e}")
+        db_logger.exception("Error SQLite al crear reserva: %s", e)
         return jsonify({"error": "Error interno en la base de datos"}), 500
     finally:
         conn.close()
@@ -223,7 +282,7 @@ def publicar_articulo():
         return jsonify({"message": "Artículo publicado", "id": cursor.lastrowid}), 201
     except sqlite3.Error as e:
         conn.rollback()
-        print(f"Error SQLite: {e}")
+        db_logger.exception("Error SQLite al publicar artículo: %s", e)
         return jsonify({"error": "Error al publicar artículo"}), 500
     finally:
         conn.close()
@@ -265,7 +324,7 @@ def comprar():
         }), 201
     except sqlite3.Error as e:
         conn.rollback()
-        print(f"🔴 ERROR EN COMPRA: {e}")
+        db_logger.exception("Error SQLite en compra: %s", e)
         return jsonify({"error": "No se pudo procesar la compra en la base de datos"}), 500
     finally:
         conn.close()
@@ -286,4 +345,5 @@ def perfil():
 
 
 if __name__ == "__main__":
+    logger.info("Iniciando API en modo debug")
     app.run(debug=True)

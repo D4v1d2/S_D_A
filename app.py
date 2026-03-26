@@ -14,6 +14,7 @@ app = Flask(__name__)
 
 def configure_logging():
     level = os.getenv("LOG_LEVEL", "INFO").upper()
+    # Permite cambiar la ruta del archivo de log por variable de entorno.
     log_file = os.getenv("LOG_FILE", os.path.join("logs", "api_registro.log"))
     log_directory = os.path.dirname(log_file)
 
@@ -62,6 +63,7 @@ logger = logging.getLogger("api_registro")
 auth_logger = logging.getLogger("api_registro.auth")
 db_logger = logging.getLogger("api_registro.db")
 routes_logger = logging.getLogger("api_registro.routes")
+
 
 def get_db_connection():
     db_logger.debug("Abriendo conexión a SQLite")

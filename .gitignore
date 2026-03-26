@@ -3,6 +3,7 @@ __pycache__/
 .pycache/
 *.db
 .env
+# Se versiona solo este archivo de log.
 logs/*
 !logs/
 !logs/api_registro.log

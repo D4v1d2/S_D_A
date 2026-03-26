@@ -1,3 +1,5 @@
 2026-03-25 19:57:42,688 | INFO | api_registro | Iniciando API en modo debug
 2026-03-25 19:58:06,742 | WARNING | api_registro.auth | Token expirado
 2026-03-25 19:58:09,943 | INFO | api_registro.auth | Login exitoso para usuario: castillokhelly@gmail.com
+2026-03-25 20:03:46,380 | INFO | api_registro | Iniciando API en modo debug
+2026-03-25 20:06:51,090 | INFO | api_registro | Iniciando API en modo debug
